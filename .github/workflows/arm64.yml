@@ -1,0 +1,138 @@
+name: arm64
+
+on:
+  push:
+    branches: [arm64-ci]
+  workflow_dispatch:
+
+jobs:
+  cpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libomp-dev libgl-dev libx11-dev cmake unzip curl python3 \
+            bison flex
+
+      - name: build every env (--cpu)
+        run: |
+          mkdir -p build/ci ci_logs
+          one() {
+            if timeout 1500 ./build.sh "$1" "build/ci/$1" --cpu > "ci_logs/$1.log" 2>&1; then
+              echo "OK $1"
+            else
+              echo "FAIL $1"
+            fi
+          }
+          export -f one
+          # first build fetches raylib, so run it alone before going parallel
+          one breakout | tee results.txt
+          ls ocean | grep -vE '^(breakout|osrs.*)$' \
+            | xargs -P "$(nproc)" -I{} bash -c 'one {}' | tee -a results.txt
+          # osrs envs share one data download, keep them serial
+          for e in $(ls ocean | grep '^osrs'); do one "$e"; done | tee -a results.txt
+          sort -k2 results.txt -o results.txt
+          echo "ok=$(grep -c ^OK results.txt) fail=$(grep -c ^FAIL results.txt)"
+
+      - name: failure excerpts
+        if: always()
+        run: |
+          for e in $(awk '/^FAIL/{print $2}' results.txt); do
+            echo "::group::$e"
+            grep -m 5 -iE 'error|undefined|not found' "ci_logs/$e.log" || tail -n 15 "ci_logs/$e.log"
+            echo "::endgroup::"
+          done
+
+      - name: nmmo3 terrain hash
+        if: always()
+        run: |
+          arch=$(uname -m)
+          if [ "$arch" = "aarch64" ]; then RL=raylib-6.0_linux_arm64; else RL=raylib-6.0_linux_amd64; fi
+          inc="-w -Iocean/nmmo3 -Isrc -Ivendor -I$RL/include -DPLATFORM_DESKTOP"
+          lib="$RL/lib/libraylib.a -lGL -lX11 -lm -lpthread"
+          run() {
+            label=$1; shift
+            clang -O2 "$@" $inc ci/terrain_sign.c -o ts $lib && { ./ts "$arch $label" || echo "$arch $label crashed"; }
+          }
+          {
+            if [ "$arch" = "x86_64" ]; then
+              run "build.sh flags" -mavx2 -mfma
+              run "fp-contract=off" -ffp-contract=off
+            else
+              run "default char"
+              run "build.sh flags" -fsigned-char
+              run "fp-contract=off" -fsigned-char -ffp-contract=off
+            fi
+          } | tee terrain.txt
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "## $(uname -m)"
+            echo '```'
+            cat terrain.txt 2>/dev/null
+            echo
+            cat results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu-${{ matrix.os }}
+          path: |
+            results.txt
+            terrain.txt
+            ci_logs/
+
+  cuda-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cuda toolkit (compile only, no gpu)
+        run: |
+          curl -sLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-13-0 cuda-crt-13-0 libnvptxcompiler-13-0 cuda-cudart-dev-13-0 cuda-profiler-api-13-0 \
+            cuda-cccl-13-0 cuda-nvml-dev-13-0 cuda-nvtx-13-0 libcublas-dev-13-0 \
+            libcusolver-dev-13-0 libcurand-dev-13-0 libnccl-dev \
+            clang libomp-dev libgl-dev libx11-dev cmake unzip ccache
+          echo /usr/local/cuda-13.0/bin >> "$GITHUB_PATH"
+
+      - name: build trainer
+        env:
+          # no gpu on the runner: target hopper (gh200) and link nvml stubs
+          NVCC_ARCH: sm_90
+          NVCC_EXTRA: -L/usr/local/cuda-13.0/lib64/stubs
+        run: |
+          mkdir -p ci_logs
+          for e in breakout nmmo3 impulse_wars tower_climb; do
+            if ./build.sh "$e" "puffer_$e" > "ci_logs/native_$e.log" 2>&1; then
+              echo "OK native $e"
+              file "puffer_$e"
+            else
+              echo "FAIL native $e"
+              grep -m 8 -iE 'error|undefined|not found' "ci_logs/native_$e.log" || tail -n 20 "ci_logs/native_$e.log"
+            fi
+          done | tee native.txt
+          ! grep -q ^FAIL native.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cuda-arm64
+          path: ci_logs/
